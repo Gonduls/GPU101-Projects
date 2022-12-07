@@ -2,3 +2,10 @@
 symgs/symgs-test 
 spmv/spmv-test 
 smith-waterman/sw-test
+
+*.exe
+
+sources/
+
+spmv/
+smith-waterman/ 
