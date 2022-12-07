@@ -7,6 +7,27 @@
 #define BLOCKN 1
 #define THREADN 512
 
+#define CHECK(call)                                                                       \
+    {                                                                                     \
+        const cudaError_t err = call;                                                     \
+        if (err != cudaSuccess)                                                           \
+        {                                                                                 \
+            printf("%s in %s at line %d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+            exit(EXIT_FAILURE);                                                           \
+        }                                                                                 \
+    }
+
+#define CHECK_KERNELCALL()                                                                \
+    {                                                                                     \
+        const cudaError_t err = cudaGetLastError();                                       \
+        if (err != cudaSuccess)                                                           \
+        {                                                                                 \
+            printf("%s in %s at line %d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+            exit(EXIT_FAILURE);                                                           \
+        }                                                                                 \
+    }
+
+
 double get_time() { // function to get the time of day in second
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -123,7 +144,26 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
     }
 }
 
-__global__ 
+__global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal){
+    __shared__ float xNew[55042369], xOld[55042369];
+    __shared__ char locks[55042369];
+    int start, end;
+    unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+    int chunk_size = (int) num_rows / (BLOCKN * THREADN);
+    start = chunk_size * index;
+    end = chunk_size * (index + 1);
+
+    if(blockIdx.x == BLOCKN - 1 && threadIdx.x == THREADN - 1)
+        end = num_rows;
+    
+    for(int i = start; i < end; i++){
+        locks[i] = 0;
+        xNew[i] = *(x + i);
+        xOld[i] = *(x + i);
+    }
+
+
+}
 
 int main(int argc, const char *argv[]){
 
@@ -157,9 +197,41 @@ int main(int argc, const char *argv[]){
     symgs_csr_sw(row_ptr, col_ind, values, num_rows, x, matrixDiagonal);
     end_cpu = get_time();
 
+    // gpu part
+
+    // allocate space
+    int *dev_row_ptr, *dev_col_ind;
+    float *dev_values, *dev_x, *dev_matrixDiagonal;
+    CHECK(cudaMalloc(&dev_row_ptr, (num_rows + 1) * sizeof(int)));
+    CHECK(cudaMalloc(&dev_col_ind, num_vals * sizeof(int)));
+    CHECK(cudaMalloc(&dev_values, num_vals * sizeof(float)));
+    CHECK(cudaMalloc(&dev_x, num_rows * sizeof(float)));
+    CHECK(cudaMalloc(&dev_matrixDiagonal, num_rows * sizeof(float)));
+    //CHECK(cudaMalloc((void*)&dev_num_rows, sizeof(int)));
+
+
+    CHECK(cudaMemcpy(dev_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dev_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dev_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dev_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dev_matrixDiagonal, matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+    //CHECK(cudaMemcpy(dev_num_rows, num_rows, sizeof(int), cudaMemcpyHostToDevice));
+
+    dim3 blocksPerGrid(BLOCKN, 1, 1);
+    dim3 threadsPerBlock(THREADN, 1, 1);
     // compute in gpu
     start_gpu = get_time();
-    // call gpu function
+    
+    symgs_csr_gpu<<<blocksPerGrid, threadsPerBlock>>>(
+        dev_row_ptr,
+        dev_col_ind,
+        dev_values,
+        num_rows,
+        dev_x,
+        dev_matrixDiagonal
+    );
+    CHECK_KERNELCALL();
+
     end_gpu = get_time();
 
     // Print time

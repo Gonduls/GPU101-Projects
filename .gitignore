@@ -6,6 +6,7 @@ smith-waterman/sw-test
 *.exe
 
 sources/
+personal/
 
 spmv/
 smith-waterman/ 
