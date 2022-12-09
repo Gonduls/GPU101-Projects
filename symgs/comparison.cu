@@ -45,7 +45,7 @@ void read_matrix(int **row_ptr, int **col_ind, float **values, float **matrixDia
     if(fscanf(file, "%d %d %d\n", num_rows, num_cols, num_vals)==EOF)
         printf("Error reading file");
 
-    printf("Rows: %d, Columns:%d, NNZ:%d\n", *num_rows, *num_cols, *num_vals);
+    //printf("Rows: %d, Columns:%d, NNZ:%d\n", *num_rows, *num_cols, *num_vals);
     int *row_ptr_t = (int *)malloc((*num_rows + 1) * sizeof(int));
     int *col_ind_t = (int *)malloc(*num_vals * sizeof(int));
     float *values_t = (float *)malloc(*num_vals * sizeof(float));
@@ -144,10 +144,8 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
     }
 }
 
-__global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal){
-    __shared__ float xNew[55042369], xOld[55042369];
-    __shared__ char locks[55042369];
-    int start, end;
+__global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, float* x2, char* locks, char* changed){
+    int start, end, i;
     unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
     int chunk_size = (int) num_rows / (BLOCKN * THREADN);
     start = chunk_size * index;
@@ -156,66 +154,143 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
     if(blockIdx.x == BLOCKN - 1 && threadIdx.x == THREADN - 1)
         end = num_rows;
     
-    for(int i = start; i < end; i++){
-        locks[i] = 0;
-        xNew[i] = *(x + i);
-        xOld[i] = *(x + i);
+    for(i = start; i < end; i++){
+        *(locks + i) = 0;
+        *(changed + i) = 0;
     }
 
+    __syncthreads();
 
+    char missed;
+    do{
+        missed = 0;
+        for(i = start; i < end; i++){
+            if(changed[i])
+                continue;
+            
+            float sum = x[i];
+            const int row_start = row_ptr[i];
+            const int row_end = row_ptr[i + 1];
+            float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
+    
+            for (int j = row_start; j < row_end; j++){
+                int index = col_ind[j];
+                if(j > i){
+                    // new value is not ready yet, try next iteration
+                    if(locks[j] == 0){
+                        missed = 1;
+                        continue;
+                    }
+
+                    sum -= values[j] * x2[index];
+                }
+                else
+                    sum -= values[j] * x[index];
+                
+            }
+            sum += x[i] * currentDiagonal;
+            x2[i] = sum / currentDiagonal;
+            locks[i] = 1;
+            changed[i] = 1;
+        }
+    } while (missed);
+
+
+    do{
+        missed = 0;
+        for(i = end - 1; i >= start; i--){
+            if(! changed[i])
+                continue;
+            
+            float sum = x2[i];
+            const int row_start = row_ptr[i];
+            const int row_end = row_ptr[i + 1];
+            float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
+    
+            for (int j = row_start; j < row_end; j++){
+                int index = col_ind[j];
+                if(j < i){
+                    // new value is not ready yet, try next iteration
+                    if(locks[j] == 1){
+                        missed = 1;
+                        continue;
+                    }
+
+                    sum -= values[j] * x2[index];
+                }
+                else
+                    sum -= values[j] * x[index];
+                
+            }
+            sum += x[i] * currentDiagonal;
+            x2[i] = sum / currentDiagonal;
+            locks[i] = 2;
+            changed[i] = 0;
+        }
+    } while (missed);
+    __syncthreads();
 }
 
 int main(int argc, const char *argv[]){
-
-    if (argc != 2){
+    /* if (argc != 2){
         printf("Usage: ./exec matrix_file");
         return 0;
-    }
-
+    } */
+    
     int *row_ptr, *col_ind, num_rows, num_cols, num_vals;
     float *values;
     float *matrixDiagonal;
-
-    const char *filename = argv[1];
+    
+    const char *filename = argv[2];
+    //printf("%s\n", filename);
 
     double start_cpu, end_cpu;
     double start_gpu, end_gpu;
 
-    read_matrix(&row_ptr, &col_ind, &values, &matrixDiagonal, filename, &num_rows, &num_cols, &num_vals);
+    read_matrix(&row_ptr, &col_ind, &values, &matrixDiagonal, "kmer_V4a.mtx", &num_rows, &num_cols, &num_vals);
     float *x = (float *)malloc(num_rows * sizeof(float));
     float *xCopy = (float *)malloc(num_rows * sizeof(float));
 
     // Generate a random vector
     srand(time(NULL));
+    int zeros = 0;
     for (int i = 0; i < num_rows; i++){
         x[i] = (rand() % 100) / (rand() % 100 + 1); // the number we use to divide cannot be 0, that's the reason of the +1
         xCopy[i] = x[i];
+        if(x[i] == 0)
+            zeros ++;
     }
-
+    //printf("%d\n", zeros);
+    
     // Compute in sw
     start_cpu = get_time();
     symgs_csr_sw(row_ptr, col_ind, values, num_rows, x, matrixDiagonal);
     end_cpu = get_time();
 
     // gpu part
-
+    //printf("Before gpu\n");
     // allocate space
     int *dev_row_ptr, *dev_col_ind;
-    float *dev_values, *dev_x, *dev_matrixDiagonal;
+    float *dev_values, *dev_x, *dev_matrixDiagonal, *dev_x2;
+    char *dev_locks, *dev_changed;
     CHECK(cudaMalloc(&dev_row_ptr, (num_rows + 1) * sizeof(int)));
     CHECK(cudaMalloc(&dev_col_ind, num_vals * sizeof(int)));
     CHECK(cudaMalloc(&dev_values, num_vals * sizeof(float)));
     CHECK(cudaMalloc(&dev_x, num_rows * sizeof(float)));
     CHECK(cudaMalloc(&dev_matrixDiagonal, num_rows * sizeof(float)));
-    //CHECK(cudaMalloc((void*)&dev_num_rows, sizeof(int)));
+    CHECK(cudaMalloc(&dev_x2, num_rows * sizeof(float)));
+    CHECK(cudaMalloc(&dev_locks, num_rows * sizeof(char)));
+    CHECK(cudaMalloc(&dev_changed, num_rows * sizeof(char)));
+    printf("after gpu malloc\n");
 
 
     CHECK(cudaMemcpy(dev_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(dev_x, x, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dev_x, xCopy, num_rows * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_matrixDiagonal, matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
-    //CHECK(cudaMemcpy(dev_num_rows, num_rows, sizeof(int), cudaMemcpyHostToDevice));
+
+    printf("After gpu memcpy\n");
 
     dim3 blocksPerGrid(BLOCKN, 1, 1);
     dim3 threadsPerBlock(THREADN, 1, 1);
@@ -228,11 +303,32 @@ int main(int argc, const char *argv[]){
         dev_values,
         num_rows,
         dev_x,
-        dev_matrixDiagonal
+        dev_matrixDiagonal,
+        dev_x2,
+        dev_locks,
+        dev_changed
     );
     CHECK_KERNELCALL();
 
+    printf("After gpu kernerlcall\n");
+    CHECK(cudaDeviceSynchronize());
+
     end_gpu = get_time();
+
+    CHECK(cudaMemcpy(&xCopy, dev_x, sizeof(float), cudaMemcpyDeviceToHost));
+    /* for(int i = 0; i< 100; i++)
+        printf("%lf\n", x[i]); */
+
+
+    printf("After gpu output memcpy\n");
+
+    for(int i = 0; i < num_rows; i++){
+        if(x[i] != *(xCopy + i)){
+            printf("WRONG RES ON GPU on x[i] for i = %d\n", i); 
+            break;
+            return 1;
+        }
+    }
 
     // Print time
     printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
@@ -243,6 +339,15 @@ int main(int argc, const char *argv[]){
     free(col_ind);
     free(values);
     free(matrixDiagonal);
+
+    CHECK(cudaFree(dev_row_ptr));
+    CHECK(cudaFree(dev_col_ind));
+    CHECK(cudaFree(dev_values));
+    CHECK(cudaFree(dev_x));
+    CHECK(cudaFree(dev_matrixDiagonal));
+    CHECK(cudaFree(dev_x2));
+    CHECK(cudaFree(dev_locks));
+    CHECK(cudaFree(dev_changed));
 
     return 0;
 }
