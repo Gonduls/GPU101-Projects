@@ -6,7 +6,7 @@
 #include <assert.h>
 
 #define BLOCKN 1
-#define THREADN 512
+#define THREADN 640
 
 #define CHECK(call)                                                                       \
     {                                                                                     \
@@ -176,22 +176,24 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
     
             for (int j = row_start; j < row_end; j++){
                 int index = col_ind[j];
-                if(index < 0)
+                
+                if(index < 0){
                     continue;
-                if(j > i){
+                }
+                if(index < i){
                     if(locks[index] == 0){
                         missed = 1;
                         continue;
                     }
                     
-                    sum -= values[j] * x2[index];
+                    sum -= (float) (((double) values[j]) * ((double)x2[index]));
                 }
-                else
-                    sum -= values[j] * x[index];
-                
+                else{
+                    sum -= (float) (((double) values[j]) * ((double)x[index]));
+                }
             }
-            sum += x[i] * currentDiagonal;
-            x2[i] = sum / currentDiagonal;
+            sum += (float) (((double) x[i]) * ((double)currentDiagonal));
+            x2[i] = (float) (((double) sum) / ((double)currentDiagonal));
             locks[i] = 1;
             changed[i] = 1;
         }
@@ -214,21 +216,21 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
                 int index = col_ind[j];
                 if(index < 0)
                     continue;
-                if(j < i){
+                if(index > i){
                     // new value is not ready yet, try next iteration
                     if(locks[index] == 1){
                         missed = 1;
                         continue;
                     }
 
-                    sum -= values[j] * x2[index];
+                    sum -= (float)((double) values[j] * (double) x[index]);
                 }
                 else
-                    sum -= values[j] * x[index];
+                    sum -= (float)((double) values[j] * (double) x2[index]);
                 
             }
-            sum += x[i] * currentDiagonal;
-            x2[i] = sum / currentDiagonal;
+            sum += (float) ((double) x2[i] * (double) currentDiagonal);
+            x[i] = (float) ((double) sum / (double) currentDiagonal);
             locks[i] = 2;
             changed[i] = 0;
         }
@@ -236,21 +238,21 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
 }
 
 int main(int argc, const char *argv[]){
-    /* if (argc != 2){
+    if (argc != 2){
         printf("Usage: ./exec matrix_file");
         return 0;
-    } */
+    }
     
     int *row_ptr, *col_ind, num_rows, num_cols, num_vals;
     float *values;
     float *matrixDiagonal;
     
-    //const char *filename = argv[2];
+    const char *filename = argv[1];
 
     double start_cpu, end_cpu;
     double start_gpu, end_gpu;
 
-    read_matrix(&row_ptr, &col_ind, &values, &matrixDiagonal, "kmer_V4a.mtx", &num_rows, &num_cols, &num_vals);
+    read_matrix(&row_ptr, &col_ind, &values, &matrixDiagonal, filename, &num_rows, &num_cols, &num_vals);
     float *x = (float *)malloc(num_rows * sizeof(float));
     float *xCopy = (float *)malloc(num_rows * sizeof(float));
 
@@ -276,7 +278,6 @@ int main(int argc, const char *argv[]){
 
     // gpu part
     
-    printf("Before gpu\n");
     // allocate space
     int *dev_row_ptr, *dev_col_ind, *dev_num_rows;
     float *dev_values, *dev_x, *dev_matrixDiagonal, *dev_x2;
@@ -290,7 +291,6 @@ int main(int argc, const char *argv[]){
     CHECK(cudaMalloc(&dev_locks, num_rows * sizeof(char)));
     CHECK(cudaMalloc(&dev_changed, num_rows * sizeof(char)));
     CHECK(cudaMalloc(&dev_num_rows, sizeof(int)));
-    printf("after gpu malloc\n");
 
 
     CHECK(cudaMemcpy(dev_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
@@ -300,7 +300,6 @@ int main(int argc, const char *argv[]){
     CHECK(cudaMemcpy(dev_matrixDiagonal, matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_num_rows, &num_rows, sizeof(int), cudaMemcpyHostToDevice));
 
-    printf("After gpu memcpy\n");
 
     dim3 blocksPerGrid(BLOCKN, 1, 1);
     dim3 threadsPerBlock(THREADN, 1, 1);
@@ -320,23 +319,18 @@ int main(int argc, const char *argv[]){
     );
     CHECK_KERNELCALL();
 
-    printf("After gpu kernerlcall\n");
 
     end_gpu = get_time();
 
     CHECK(cudaMemcpy(xCopy, dev_x, num_rows * sizeof(float), cudaMemcpyDeviceToHost));
-    printf("After gpu output memcpy\n");
     
-    //CHECK(cudaDeviceSynchronize());
-    printf("After gpu sync\n");
-
     FILE* output = fopen("./personal/errors.txt", "w");
     int errors = 0;
     for(int i = 0; i < num_rows; i++){
-        if(x[i] != *(xCopy + i)){
+        if(x[i] - xCopy[i] > 0.001 || x[i] - xCopy[i] < -0.001 ){
             errors ++;
             if(errors < 100)
-                fprintf(output, "WRONG RES ON GPU on x[i] for i = %d. x[i]=%lf, xCopy[i]=%lf\n", i, x[i], xCopy[i]); 
+                fprintf(output, "WRONG RES ON GPU on x[i] for i = %d. x[i]=%.10lf, xCopy[i]=%.10lf\n", i, x[i], xCopy[i]); 
             //return 1;
         }
     }
@@ -348,7 +342,7 @@ int main(int argc, const char *argv[]){
     printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
     printf("SYMGS Time GPU: %.10lf\n", end_gpu - start_gpu);
 
-    // Free
+    // Free: TODO
     free(row_ptr);
     free(col_ind);
     free(values);
