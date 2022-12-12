@@ -192,14 +192,14 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
                     sum -= (float) (((double) values[j]) * ((double)x[index]));
                 }
             }
+            if(missed)
+                continue;
             sum += (float) (((double) x[i]) * ((double)currentDiagonal));
             x2[i] = (float) (((double) sum) / ((double)currentDiagonal));
             locks[i] = 1;
             changed[i] = 1;
         }
     } while (missed);
-
-    __syncthreads();
 
     do{
         missed = 0;
@@ -218,7 +218,7 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
                     continue;
                 if(index > i){
                     // new value is not ready yet, try next iteration
-                    if(locks[index] == 1){
+                    if(locks[index] < 2){
                         missed = 1;
                         continue;
                     }
@@ -229,6 +229,9 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
                     sum -= (float)((double) values[j] * (double) x2[index]);
                 
             }
+            if(missed)
+                continue;
+            
             sum += (float) ((double) x2[i] * (double) currentDiagonal);
             x[i] = (float) ((double) sum / (double) currentDiagonal);
             locks[i] = 2;
@@ -321,13 +324,19 @@ int main(int argc, const char *argv[]){
 
 
     end_gpu = get_time();
-
+    
     CHECK(cudaMemcpy(xCopy, dev_x, num_rows * sizeof(float), cudaMemcpyDeviceToHost));
     
     FILE* output = fopen("./personal/errors.txt", "w");
     int errors = 0;
+    float maxError = 0.0;
     for(int i = 0; i < num_rows; i++){
-        if(x[i] - xCopy[i] > 0.001 || x[i] - xCopy[i] < -0.001 ){
+        if((x[i] - xCopy[i] > 0.00001 || x[i] - xCopy[i] < -0.00001) && (x[i] - xCopy[i]) / x[i] > 0.001 ){
+
+            float err = x[i] - xCopy[i];
+            err = err > 0 ? err : -err;
+            maxError = err > maxError ? err : maxError;
+
             errors ++;
             if(errors < 100)
                 fprintf(output, "WRONG RES ON GPU on x[i] for i = %d. x[i]=%.10lf, xCopy[i]=%.10lf\n", i, x[i], xCopy[i]); 
@@ -335,7 +344,7 @@ int main(int argc, const char *argv[]){
         }
     }
 
-    printf("Errors: %d\n", errors);
+    printf("Errors: %d\nMax error: %lf\n", errors, maxError);
     fclose(output);
 
     // Print time
