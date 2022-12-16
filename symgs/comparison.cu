@@ -5,8 +5,8 @@
 #include <sys/time.h>
 #include <assert.h>
 
-#define BLOCKN 1
-#define THREADN 640
+#define BLOCKN 512
+#define THREADN 1024
 
 #define CHECK(call)                                                                       \
     {                                                                                     \
@@ -145,7 +145,8 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
     }
 }
 
-__global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const float *values, const int *num_rows, float *x, float *matrixDiagonal, float* x2, char* locks, char* changed){
+// GPU implementation of SYMGS using CSR
+__global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const float *values, const int *num_rows, float *x, float *matrixDiagonal, float* x2, char* locks){
     int start, end, i;
     unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
     int chunk_size = (int) *(num_rows) / (BLOCKN * THREADN);
@@ -155,89 +156,113 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
     if(blockIdx.x == BLOCKN - 1 && threadIdx.x == THREADN - 1)
         end = *(num_rows);
     
-    for(i = start; i < end; i++){
+    // locks are used to communicate wether the new value for a variable is ready or not
+    for(i = start; i < end; i++)
         locks[i] = 0;
-        changed[i] = 0;
-    }
 
     __syncthreads();
-    
-    char missed;
+
+        
+    char missedInt; // used as boolean to indicate that a row was missed - internal for
+    char missedExt;  // used as boolean to indicate that a row was missed - external for
     do{
-        missed = 0;
+        missedExt = 0;
         for(i = start; i < end; i++){
-            if(changed[i])
+            // if I alread calculated the value for this row: continue
+            if(locks[i])
                 continue;
                 
             float sum = x[i];
             const int row_start = row_ptr[i];
             const int row_end = row_ptr[i + 1];
-            float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
+            float currentDiagonal = matrixDiagonal[i];
     
+            missedInt = 0;
             for (int j = row_start; j < row_end; j++){
                 int index = col_ind[j];
                 
-                if(index < 0){
+                // needed to address rogue -1 index
+                if(index < 0)
                     continue;
-                }
+                
+                // if I need a new value
                 if(index < i){
+                    // if that value is not ready yet: skip this round, try next time
                     if(locks[index] == 0){
-                        missed = 1;
+                        missedInt = 1;
+                        missedExt = 1;
                         continue;
                     }
-                    
+                    // else take the new value from x2 - new values array
                     sum -= (float) (((double) values[j]) * ((double)x2[index]));
                 }
+                // else take old value
                 else{
                     sum -= (float) (((double) values[j]) * ((double)x[index]));
                 }
             }
-            if(missed)
+            // if I missed this row: don't update with wrong new value 
+            if(missedInt)
                 continue;
+
             sum += (float) (((double) x[i]) * ((double)currentDiagonal));
             x2[i] = (float) (((double) sum) / ((double)currentDiagonal));
             locks[i] = 1;
-            changed[i] = 1;
         }
-    } while (missed);
+    } while (missedExt);
 
+    // Now x becomes the new value array and x2 becomes the old value array
     do{
-        missed = 0;
+        missedExt = 0;
         for(i = end - 1; i >= start; i--){
-            if(! changed[i])
+            // if I alread calculated the value for this row: continue
+            if(locks[i] >> 1)
                 continue;
             
             float sum = x2[i];
             const int row_start = row_ptr[i];
             const int row_end = row_ptr[i + 1];
-            float currentDiagonal = matrixDiagonal[i]; // Current diagonal value
+            float currentDiagonal = matrixDiagonal[i];
     
+            missedInt = 0;
             for (int j = row_start; j < row_end; j++){
                 int index = col_ind[j];
+
+                // needed to address rogue -1 index
                 if(index < 0)
                     continue;
+
+                // if I need a new value
                 if(index > i){
                     // new value is not ready yet, try next iteration
                     if(locks[index] < 2){
-                        missed = 1;
+                        missedInt = 1;
+                        missedExt = 1;
+                        continue;
+                    }
+                    // else take the new value from x - new values array
+                    sum -= (float)((double) values[j] * (double) x[index]);
+                }
+                else{
+                    // old value is not ready yet, try nex iteration
+                    if(locks[index] < 1){
+                        missedInt = 1;
+                        missedExt = 1;
                         continue;
                     }
 
-                    sum -= (float)((double) values[j] * (double) x[index]);
-                }
-                else
+                    // else take old value
                     sum -= (float)((double) values[j] * (double) x2[index]);
-                
+                }   
             }
-            if(missed)
+            if(missedInt)
                 continue;
             
             sum += (float) ((double) x2[i] * (double) currentDiagonal);
             x[i] = (float) ((double) sum / (double) currentDiagonal);
             locks[i] = 2;
-            changed[i] = 0;
         }
-    } while (missed);
+    } while (missedExt);
 }
 
 int main(int argc, const char *argv[]){
@@ -251,6 +276,7 @@ int main(int argc, const char *argv[]){
     float *matrixDiagonal;
     
     const char *filename = argv[1];
+    filename = "kmer_V4a.mtx";
 
     double start_cpu, end_cpu;
     double start_gpu, end_gpu;
@@ -284,7 +310,7 @@ int main(int argc, const char *argv[]){
     // allocate space
     int *dev_row_ptr, *dev_col_ind, *dev_num_rows;
     float *dev_values, *dev_x, *dev_matrixDiagonal, *dev_x2;
-    char *dev_locks, *dev_changed;
+    char *dev_locks;
     CHECK(cudaMalloc(&dev_row_ptr, (num_rows + 1) * sizeof(int)));
     CHECK(cudaMalloc(&dev_col_ind, num_vals * sizeof(int)));
     CHECK(cudaMalloc(&dev_values, num_vals * sizeof(float)));
@@ -292,7 +318,6 @@ int main(int argc, const char *argv[]){
     CHECK(cudaMalloc(&dev_matrixDiagonal, num_rows * sizeof(float)));
     CHECK(cudaMalloc(&dev_x2, num_rows * sizeof(float)));
     CHECK(cudaMalloc(&dev_locks, num_rows * sizeof(char)));
-    CHECK(cudaMalloc(&dev_changed, num_rows * sizeof(char)));
     CHECK(cudaMalloc(&dev_num_rows, sizeof(int)));
 
 
@@ -317,45 +342,45 @@ int main(int argc, const char *argv[]){
         dev_x,
         dev_matrixDiagonal,
         dev_x2,
-        dev_locks,
-        dev_changed
+        dev_locks
     );
     CHECK_KERNELCALL();
+    CHECK(cudaDeviceSynchronize());
 
 
     end_gpu = get_time();
     
     CHECK(cudaMemcpy(xCopy, dev_x, num_rows * sizeof(float), cudaMemcpyDeviceToHost));
     
-    FILE* output = fopen("./personal/errors.txt", "w");
     int errors = 0;
     float maxError = 0.0;
     for(int i = 0; i < num_rows; i++){
-        if((x[i] - xCopy[i] > 0.00001 || x[i] - xCopy[i] < -0.00001) && (x[i] - xCopy[i]) / x[i] > 0.001 ){
+        if((x[i] - xCopy[i] > 0.0001 || x[i] - xCopy[i] < -0.0001) && (x[i] - xCopy[i]) / x[i] > 0.001 ){
 
             float err = x[i] - xCopy[i];
             err = err > 0 ? err : -err;
             maxError = err > maxError ? err : maxError;
 
             errors ++;
-            if(errors < 100)
-                fprintf(output, "WRONG RES ON GPU on x[i] for i = %d. x[i]=%.10lf, xCopy[i]=%.10lf\n", i, x[i], xCopy[i]); 
-            //return 1;
         }
     }
 
-    printf("Errors: %d\nMax error: %lf\n", errors, maxError);
-    fclose(output);
+    if(errors > 0)
+        printf("Errors: %d\nMax error: %lf\n", errors, maxError);
+    
+    //fclose(output);
 
     // Print time
     printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
     printf("SYMGS Time GPU: %.10lf\n", end_gpu - start_gpu);
 
-    // Free: TODO
+    // Free
     free(row_ptr);
     free(col_ind);
     free(values);
     free(matrixDiagonal);
+    free(x);
+    free(xCopy);
 
     CHECK(cudaFree(dev_row_ptr));
     CHECK(cudaFree(dev_col_ind));
@@ -364,7 +389,6 @@ int main(int argc, const char *argv[]){
     CHECK(cudaFree(dev_matrixDiagonal));
     CHECK(cudaFree(dev_x2));
     CHECK(cudaFree(dev_locks));
-    CHECK(cudaFree(dev_changed));
 
     return 0;
 }
