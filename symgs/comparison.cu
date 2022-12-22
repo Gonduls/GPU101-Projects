@@ -5,8 +5,8 @@
 #include <sys/time.h>
 #include <assert.h>
 
-#define BLOCKN 512
-#define THREADN 1024
+#define BLOCKN 1024
+#define THREADN 640
 
 #define CHECK(call)                                                                       \
     {                                                                                     \
@@ -146,21 +146,17 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 }
 
 // GPU implementation of SYMGS using CSR
-__global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const float *values, const int *num_rows, float *x, float *matrixDiagonal, float* x2, char* locks){
+__global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, float* x2, char* locks, int chunk_size){
     int start, end, i;
     unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
-    int chunk_size = (int) *(num_rows) / (BLOCKN * THREADN);
     start = chunk_size * index;
     end = chunk_size * (index + 1);
 
-    if(blockIdx.x == BLOCKN - 1 && threadIdx.x == THREADN - 1)
-        end = *(num_rows);
+    if(start >= num_rows)
+        return;        
     
-    // locks are used to communicate wether the new value for a variable is ready or not
-    for(i = start; i < end; i++)
-        locks[i] = 0;
-
-    __syncthreads();
+    if(end > num_rows)
+        end = num_rows;
 
         
     char missedInt; // used as boolean to indicate that a row was missed - internal for
@@ -306,9 +302,16 @@ int main(int argc, const char *argv[]){
     end_cpu = get_time();
 
     // gpu part
+
+    int chunk_size = (num_rows / (THREADN * BLOCKN)) + 1;
+    int blockn = BLOCKN;
+
+    // needed because there might be excess blocks in chunck calculation
+    while(blockn*THREADN*chunk_size > num_rows)
+        blockn --;
     
     // allocate space
-    int *dev_row_ptr, *dev_col_ind, *dev_num_rows;
+    int *dev_row_ptr, *dev_col_ind;
     float *dev_values, *dev_x, *dev_matrixDiagonal, *dev_x2;
     char *dev_locks;
     CHECK(cudaMalloc(&dev_row_ptr, (num_rows + 1) * sizeof(int)));
@@ -318,7 +321,6 @@ int main(int argc, const char *argv[]){
     CHECK(cudaMalloc(&dev_matrixDiagonal, num_rows * sizeof(float)));
     CHECK(cudaMalloc(&dev_x2, num_rows * sizeof(float)));
     CHECK(cudaMalloc(&dev_locks, num_rows * sizeof(char)));
-    CHECK(cudaMalloc(&dev_num_rows, sizeof(int)));
 
 
     CHECK(cudaMemcpy(dev_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
@@ -326,11 +328,14 @@ int main(int argc, const char *argv[]){
     CHECK(cudaMemcpy(dev_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_x, xCopy, num_rows * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_matrixDiagonal, matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(dev_num_rows, &num_rows, sizeof(int), cudaMemcpyHostToDevice));
 
+    // initialize lock vector to all 0 in host then copy to device
+    char * host_locks = (char *) calloc(num_rows, sizeof(char));
+    CHECK(cudaMemcpy(dev_locks, host_locks, num_rows * sizeof(char), cudaMemcpyHostToDevice));
 
     dim3 blocksPerGrid(BLOCKN, 1, 1);
     dim3 threadsPerBlock(THREADN, 1, 1);
+    
     // compute in gpu
     start_gpu = get_time();
     
@@ -338,15 +343,15 @@ int main(int argc, const char *argv[]){
         dev_row_ptr,
         dev_col_ind,
         dev_values,
-        dev_num_rows,
+        num_rows,
         dev_x,
         dev_matrixDiagonal,
         dev_x2,
-        dev_locks
+        dev_locks,
+        chunk_size
     );
     CHECK_KERNELCALL();
     CHECK(cudaDeviceSynchronize());
-
 
     end_gpu = get_time();
     
@@ -367,8 +372,6 @@ int main(int argc, const char *argv[]){
 
     if(errors > 0)
         printf("Errors: %d\nMax error: %lf\n", errors, maxError);
-    
-    //fclose(output);
 
     // Print time
     printf("SYMGS Time CPU: %.10lf\n", end_cpu - start_cpu);
