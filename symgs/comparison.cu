@@ -157,7 +157,6 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
     
     if(end > num_rows)
         end = num_rows;
-
         
     char missedInt; // used as boolean to indicate that a row was missed - internal for
     char missedExt;  // used as boolean to indicate that a row was missed - external for
@@ -304,11 +303,6 @@ int main(int argc, const char *argv[]){
     // gpu part
 
     int chunk_size = (num_rows / (THREADN * BLOCKN)) + 1;
-    int blockn = BLOCKN;
-
-    // needed because there might be excess blocks in chunck calculation
-    while(blockn*THREADN*chunk_size > num_rows)
-        blockn --;
     
     // allocate space
     int *dev_row_ptr, *dev_col_ind;
