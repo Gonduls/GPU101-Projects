@@ -5,8 +5,8 @@
 #include <sys/time.h>
 #include <assert.h>
 
-#define BLOCKN 512
-#define THREADN 1024
+#define BLOCKN 1056
+#define THREADN 512
 
 #define CHECK(call)                                                                       \
     {                                                                                     \
@@ -146,19 +146,20 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 }
 
 // GPU implementation of SYMGS using CSR
-__global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const float *values, const int *num_rows, float *x, float *matrixDiagonal, float* x2, char* locks){
-    int start, end, i;
+__global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, float* x2, char* locks, int chunk_size){
+    extern __shared__ char local_locks[];
+    int start, end, i, local_start;
     unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
-    int chunk_size = (int) *(num_rows) / (BLOCKN * THREADN);
     start = chunk_size * index;
     end = chunk_size * (index + 1);
+    local_start = chunk_size*blockIdx.x * blockDim.x;
 
     if(blockIdx.x == BLOCKN - 1 && threadIdx.x == THREADN - 1)
-        end = *(num_rows);
+        end = num_rows;
     
-    // locks are used to communicate wether the new value for a variable is ready or not
-    for(i = start; i < end; i++)
-        locks[i] = 0;
+    int s = chunk_size*threadIdx.x;
+    for(i = 0; i < chunk_size; i++)
+        local_locks[i + s] = 0;
 
     __syncthreads();
 
@@ -169,7 +170,7 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
         missedExt = 0;
         for(i = start; i < end; i++){
             // if I alread calculated the value for this row: continue
-            if(locks[i])
+            if(local_locks[i - local_start])
                 continue;
                 
             float sum = x[i];
@@ -208,6 +209,7 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
             sum += (float) (((double) x[i]) * ((double)currentDiagonal));
             x2[i] = (float) (((double) sum) / ((double)currentDiagonal));
             locks[i] = 1;
+            local_locks[i - local_start] = 1;
         }
     } while (missedExt);
 
@@ -216,7 +218,7 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
         missedExt = 0;
         for(i = end - 1; i >= start; i--){
             // if I alread calculated the value for this row: continue
-            if(locks[i] >> 1)
+            if(local_locks[i - local_start] >> 1)
                 continue;
             
             float sum = x2[i];
@@ -261,27 +263,29 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
             sum += (float) ((double) x2[i] * (double) currentDiagonal);
             x[i] = (float) ((double) sum / (double) currentDiagonal);
             locks[i] = 2;
+            local_locks[i - local_start] = 2;
         }
     } while (missedExt);
 }
 
 int main(int argc, const char *argv[]){
-    if (argc != 2){
+    /* if (argc != 2){
         printf("Usage: ./exec matrix_file");
         return 0;
-    }
+    } */
     
     int *row_ptr, *col_ind, num_rows, num_cols, num_vals;
     float *values;
     float *matrixDiagonal;
     
     const char *filename = argv[1];
-    filename = "kmer_V4a.mtx";
+    //filename = "kmer_V4a.mtx";
 
     double start_cpu, end_cpu;
     double start_gpu, end_gpu;
 
     read_matrix(&row_ptr, &col_ind, &values, &matrixDiagonal, filename, &num_rows, &num_cols, &num_vals);
+    printf("Read matrix\n");
     float *x = (float *)malloc(num_rows * sizeof(float));
     float *xCopy = (float *)malloc(num_rows * sizeof(float));
 
@@ -307,8 +311,11 @@ int main(int argc, const char *argv[]){
 
     // gpu part
     
+    int chunk_size = (num_rows / (THREADN * BLOCKN)) + 1;
+    printf("Chunck size = %d\nNum rows: %d\n", chunk_size, num_rows);
+
     // allocate space
-    int *dev_row_ptr, *dev_col_ind, *dev_num_rows;
+    int *dev_row_ptr, *dev_col_ind;
     float *dev_values, *dev_x, *dev_matrixDiagonal, *dev_x2;
     char *dev_locks;
     CHECK(cudaMalloc(&dev_row_ptr, (num_rows + 1) * sizeof(int)));
@@ -318,31 +325,36 @@ int main(int argc, const char *argv[]){
     CHECK(cudaMalloc(&dev_matrixDiagonal, num_rows * sizeof(float)));
     CHECK(cudaMalloc(&dev_x2, num_rows * sizeof(float)));
     CHECK(cudaMalloc(&dev_locks, num_rows * sizeof(char)));
-    CHECK(cudaMalloc(&dev_num_rows, sizeof(int)));
-
 
     CHECK(cudaMemcpy(dev_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_col_ind, col_ind, num_vals * sizeof(int), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_values, values, num_vals * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_x, xCopy, num_rows * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(dev_matrixDiagonal, matrixDiagonal, num_rows * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(dev_num_rows, &num_rows, sizeof(int), cudaMemcpyHostToDevice));
+    
+    // initialize lock vector to all 0 in host then copy to device
+    char * host_locks = (char *) malloc(num_rows * sizeof(char));
+    for(int i = 0; i < num_rows; i++)
+        host_locks[i] = 0;
+    
+    CHECK(cudaMemcpy(dev_locks, host_locks, num_rows * sizeof(char), cudaMemcpyHostToDevice));
 
 
     dim3 blocksPerGrid(BLOCKN, 1, 1);
     dim3 threadsPerBlock(THREADN, 1, 1);
     // compute in gpu
     start_gpu = get_time();
-    
-    symgs_csr_gpu<<<blocksPerGrid, threadsPerBlock>>>(
+    //printf("Shared memory memory allocating: %d\n", chunk_size*THREADN);
+    symgs_csr_gpu<<<blocksPerGrid, threadsPerBlock, chunk_size*THREADN>>>(
         dev_row_ptr,
         dev_col_ind,
         dev_values,
-        dev_num_rows,
+        num_rows,
         dev_x,
         dev_matrixDiagonal,
         dev_x2,
-        dev_locks
+        dev_locks,
+        chunk_size
     );
     CHECK_KERNELCALL();
     CHECK(cudaDeviceSynchronize());
