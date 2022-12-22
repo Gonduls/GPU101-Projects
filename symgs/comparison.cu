@@ -153,9 +153,10 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
     start = chunk_size * index;
     end = chunk_size * (index + 1);
     local_start = chunk_size*blockIdx.x * blockDim.x;
-
     if(blockIdx.x == BLOCKN - 1 && threadIdx.x == THREADN - 1)
         end = num_rows;
+
+    
     
     int s = chunk_size*threadIdx.x;
     for(i = 0; i < chunk_size; i++)
@@ -163,7 +164,12 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
 
     __syncthreads();
 
-        
+    if(start >= num_rows)
+        return;        
+    
+    if(end > num_rows)
+        end = num_rows;
+    
     char missedInt; // used as boolean to indicate that a row was missed - internal for
     char missedExt;  // used as boolean to indicate that a row was missed - external for
     do{
@@ -172,7 +178,7 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
             // if I alread calculated the value for this row: continue
             if(local_locks[i - local_start])
                 continue;
-                
+
             float sum = x[i];
             const int row_start = row_ptr[i];
             const int row_end = row_ptr[i + 1];
@@ -208,8 +214,8 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
 
             sum += (float) (((double) x[i]) * ((double)currentDiagonal));
             x2[i] = (float) (((double) sum) / ((double)currentDiagonal));
-            locks[i] = 1;
             local_locks[i - local_start] = 1;
+            locks[i] = 1;
         }
     } while (missedExt);
 
@@ -262,8 +268,8 @@ __global__ void symgs_csr_gpu(const int *row_ptr, const int *col_ind, const floa
             
             sum += (float) ((double) x2[i] * (double) currentDiagonal);
             x[i] = (float) ((double) sum / (double) currentDiagonal);
-            locks[i] = 2;
             local_locks[i - local_start] = 2;
+            locks[i] = 2;
         }
     } while (missedExt);
 }
@@ -279,13 +285,13 @@ int main(int argc, const char *argv[]){
     float *matrixDiagonal;
     
     const char *filename = argv[1];
-    //filename = "kmer_V4a.mtx";
+    filename = "kmer_V4a.mtx";
 
     double start_cpu, end_cpu;
     double start_gpu, end_gpu;
 
     read_matrix(&row_ptr, &col_ind, &values, &matrixDiagonal, filename, &num_rows, &num_cols, &num_vals);
-    printf("Read matrix\n");
+    //printf("Read matrix\n");
     float *x = (float *)malloc(num_rows * sizeof(float));
     float *xCopy = (float *)malloc(num_rows * sizeof(float));
 
@@ -312,7 +318,7 @@ int main(int argc, const char *argv[]){
     // gpu part
     
     int chunk_size = (num_rows / (THREADN * BLOCKN)) + 1;
-    printf("Chunck size = %d\nNum rows: %d\n", chunk_size, num_rows);
+    //printf("Chunck size = %d\nNum rows: %d\n", chunk_size, num_rows);
 
     // allocate space
     int *dev_row_ptr, *dev_col_ind;
@@ -340,7 +346,7 @@ int main(int argc, const char *argv[]){
     CHECK(cudaMemcpy(dev_locks, host_locks, num_rows * sizeof(char), cudaMemcpyHostToDevice));
 
 
-    dim3 blocksPerGrid(BLOCKN, 1, 1);
+    dim3 blocksPerGrid(BLOCKN - 1, 1, 1);
     dim3 threadsPerBlock(THREADN, 1, 1);
     // compute in gpu
     start_gpu = get_time();
