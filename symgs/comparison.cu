@@ -5,8 +5,10 @@
 #include <sys/time.h>
 #include <assert.h>
 
-#define BLOCKN 10240
+//#define BLOCKN 10240
 #define THREADN 320
+#define CALLSN 10
+#define LINESPERTHREAD 8
 
 #define CHECK(call)                                                                       \
     {                                                                                     \
@@ -146,16 +148,17 @@ void symgs_csr_sw(const int *row_ptr, const int *col_ind, const float *values, c
 }
 
 // GPU implementation of SYMGS using CSR
-__global__ void symgs_csr_gpu_forward(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, float* x2, char* locks, char* not_done, char*thread_done, int chunk_size){
+__global__ void symgs_csr_gpu_forward(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, float* x2, char* locks, char* not_done, char*thread_done, int index0){
     int start, end, i;
     unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+    index += index0;
 
     if(thread_done[index])
         return;
     thread_done[index] = 1;
 
-    start = chunk_size * index;
-    end = chunk_size * (index + 1);
+    start = LINESPERTHREAD * index;
+    end = LINESPERTHREAD * (index + 1);
 
     if(start >= num_rows)
         return;        
@@ -210,16 +213,17 @@ __global__ void symgs_csr_gpu_forward(const int *row_ptr, const int *col_ind, co
 }
 
 // GPU implementation of SYMGS using CSR
-__global__ void symgs_csr_gpu_backward(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, float* x2, char* locks, char* not_done, char*thread_done, int chunk_size){
+__global__ void symgs_csr_gpu_backward(const int *row_ptr, const int *col_ind, const float *values, const int num_rows, float *x, float *matrixDiagonal, float* x2, char* locks, char* not_done, char*thread_done, int index0){
     int start, end, i;
     unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+    index += index0;
 
     if(thread_done[index] == 2)
         return;
     thread_done[index] = 2;
 
-    start = chunk_size * index;
-    end = chunk_size * (index + 1);
+    start = LINESPERTHREAD * index;
+    end = LINESPERTHREAD * (index + 1);
 
     if(start >= num_rows)
         return;        
@@ -273,6 +277,7 @@ __global__ void symgs_csr_gpu_backward(const int *row_ptr, const int *col_ind, c
 }
 
 int main(int argc, const char *argv[]){
+    printf("Configs: THREADN = %d, CALLSN = %d, LINESPERTHREAD = %d\n", THREADN, CALLSN, LINESPERTHREAD);
     /* if (argc != 2){
         printf("Usage: ./exec matrix_file");
         return 0;
@@ -314,13 +319,13 @@ int main(int argc, const char *argv[]){
 
     // gpu part
 
-    int chunk_size = (num_rows / (THREADN * BLOCKN)) + 1;
-    int blockn = BLOCKN;
+    int blockN = num_rows / (THREADN * LINESPERTHREAD) + 1;
+    printf("BlockN: %d\n", blockN);
 
     // needed because there might be excess blocks in chunck calculation
-    while(blockn*THREADN*chunk_size > num_rows)
-        blockn --;
-    blockn ++ ; // there might be a last block that is only partially useful
+    while(blockN*THREADN*LINESPERTHREAD> num_rows)
+        blockN --;
+    blockN ++ ; // there might be a last block that is only partially useful
     
     // allocate space
     int *dev_row_ptr, *dev_col_ind;
@@ -334,7 +339,7 @@ int main(int argc, const char *argv[]){
     CHECK(cudaMalloc(&dev_x2, num_rows * sizeof(float)));
     CHECK(cudaMalloc(&dev_locks, num_rows * sizeof(char)));
     CHECK(cudaMalloc(&dev_not_done, sizeof(char)));
-    CHECK(cudaMalloc(&dev_thread_done, (blockn*THREADN)*sizeof(char)));
+    CHECK(cudaMalloc(&dev_thread_done, (blockN*THREADN)*sizeof(char)));
 
 
     CHECK(cudaMemcpy(dev_row_ptr, row_ptr, (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
@@ -345,62 +350,79 @@ int main(int argc, const char *argv[]){
 
     // initialize lock vector to all 0 in host then copy to device
     char * host_locks = (char *) calloc(num_rows, sizeof(char));
-    char * host_thread_done = (char *) calloc((blockn*THREADN), sizeof(char));
+    char * host_thread_done = (char *) calloc((blockN*THREADN), sizeof(char));
     CHECK(cudaMemcpy(dev_locks, host_locks, num_rows * sizeof(char), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(dev_thread_done, host_thread_done, (blockn*THREADN) * sizeof(char), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dev_thread_done, host_thread_done, (blockN*THREADN) * sizeof(char), cudaMemcpyHostToDevice));
 
-    dim3 blocksPerGrid(blockn, 1, 1);
     dim3 threadsPerBlock(THREADN, 1, 1);
     
     // compute in gpu
     start_gpu = get_time();
 
-    char not_done;
-    do{
-        not_done = 0;
-        CHECK(cudaMemcpy(dev_not_done, &not_done, sizeof(char), cudaMemcpyHostToDevice));
+    // forward sweep
+    int blocksToCompute = blockN;
+    for(int i = 0; i < CALLSN; i++){
+        int blocksInRound = blocksToCompute / (CALLSN - i);
+        dim3 blocksPerGrid(blocksInRound, 1, 1);
+        char not_done;
+        do{
+            not_done = 0;
+            CHECK(cudaMemcpy(dev_not_done, &not_done, sizeof(char), cudaMemcpyHostToDevice));
 
-        symgs_csr_gpu_forward<<<blocksPerGrid, threadsPerBlock>>>(
-            dev_row_ptr,
-            dev_col_ind,
-            dev_values,
-            num_rows,
-            dev_x,
-            dev_matrixDiagonal,
-            dev_x2,
-            dev_locks,
-            dev_not_done,
-            dev_thread_done,
-            chunk_size
-        );
-        CHECK_KERNELCALL();
-        CHECK(cudaDeviceSynchronize());
+            symgs_csr_gpu_forward<<<blocksPerGrid, threadsPerBlock>>>(
+                dev_row_ptr,
+                dev_col_ind,
+                dev_values,
+                num_rows,
+                dev_x,
+                dev_matrixDiagonal,
+                dev_x2,
+                dev_locks,
+                dev_not_done,
+                dev_thread_done,
+                (blockN - blocksToCompute)*THREADN
+            );
+            CHECK_KERNELCALL();
+            CHECK(cudaDeviceSynchronize());
 
-        CHECK(cudaMemcpy(&not_done, dev_not_done, sizeof(char), cudaMemcpyDeviceToHost));
-    } while(not_done);
-    
-    do{
-        not_done = 0;
-        CHECK(cudaMemcpy(dev_not_done, &not_done, sizeof(char), cudaMemcpyHostToDevice));
+            CHECK(cudaMemcpy(&not_done, dev_not_done, sizeof(char), cudaMemcpyDeviceToHost));
+        } while(not_done);
 
-        symgs_csr_gpu_backward<<<blocksPerGrid, threadsPerBlock>>>(
-            dev_row_ptr,
-            dev_col_ind,
-            dev_values,
-            num_rows,
-            dev_x,
-            dev_matrixDiagonal,
-            dev_x2,
-            dev_locks,
-            dev_not_done,
-            dev_thread_done,
-            chunk_size
-        );
-        CHECK_KERNELCALL();
-        CHECK(cudaDeviceSynchronize());
+        blocksToCompute -= blocksInRound;
+    }
 
-        CHECK(cudaMemcpy(&not_done, dev_not_done, sizeof(char), cudaMemcpyDeviceToHost));
-    } while(not_done);
+    // backward sweep
+    blocksToCompute = blockN;
+    for(int i = 0; i < CALLSN; i++){
+        int blocksInRound = blocksToCompute / (CALLSN - i);
+        dim3 blocksPerGrid(blocksInRound, 1, 1);
+        blocksToCompute -= blocksInRound;
+        
+        char not_done;
+        do{
+            not_done = 0;
+            CHECK(cudaMemcpy(dev_not_done, &not_done, sizeof(char), cudaMemcpyHostToDevice));
+
+            symgs_csr_gpu_backward<<<blocksPerGrid, threadsPerBlock>>>(
+                dev_row_ptr,
+                dev_col_ind,
+                dev_values,
+                num_rows,
+                dev_x,
+                dev_matrixDiagonal,
+                dev_x2,
+                dev_locks,
+                dev_not_done,
+                dev_thread_done,
+                (blocksToCompute)*THREADN
+            );
+            CHECK_KERNELCALL();
+            CHECK(cudaDeviceSynchronize());
+
+            CHECK(cudaMemcpy(&not_done, dev_not_done, sizeof(char), cudaMemcpyDeviceToHost));
+        } while(not_done);
+
+    }
 
     end_gpu = get_time();
     
