@@ -303,6 +303,12 @@ int main(int argc, const char *argv[]){
     // gpu part
 
     int chunk_size = (num_rows / (THREADN * BLOCKN)) + 1;
+    int blockn = BLOCKN;
+
+    // needed because there might be excess blocks in chunck calculation
+    while(blockn*THREADN*chunk_size > num_rows)
+        blockn --;
+    blockn ++ ; // there might be a last block that is only partially useful
     
     // allocate space
     int *dev_row_ptr, *dev_col_ind;
@@ -327,7 +333,7 @@ int main(int argc, const char *argv[]){
     char * host_locks = (char *) calloc(num_rows, sizeof(char));
     CHECK(cudaMemcpy(dev_locks, host_locks, num_rows * sizeof(char), cudaMemcpyHostToDevice));
 
-    dim3 blocksPerGrid(BLOCKN, 1, 1);
+    dim3 blocksPerGrid(blockn, 1, 1);
     dim3 threadsPerBlock(THREADN, 1, 1);
     
     // compute in gpu
