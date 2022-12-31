@@ -47,7 +47,6 @@ void read_matrix(int **row_ptr, int **col_ind, float **values, float **matrixDia
     if(fscanf(file, "%d %d %d\n", num_rows, num_cols, num_vals)==EOF)
         printf("Error reading file");
 
-    //printf("Rows: %d, Columns:%d, NNZ:%d\n", *num_rows, *num_cols, *num_vals);
     int *row_ptr_t = (int *)malloc((*num_rows + 1) * sizeof(int));
     int *col_ind_t = (int *)malloc(*num_vals * sizeof(int));
     float *values_t = (float *)malloc(*num_vals * sizeof(float));
@@ -277,7 +276,6 @@ __global__ void symgs_csr_gpu_backward(const int *row_ptr, const int *col_ind, c
 }
 
 int main(int argc, const char *argv[]){
-    printf("Configs: THREADN = %d, CHUNKSN = %d, LINESPERTHREAD = %d\n", THREADN, CHUNKSN, LINESPERTHREAD);
     if (argc != 2){
         printf("Usage: ./exec matrix_file");
         return 0;
